@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Can Toss</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #222; touch-action: none; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        .ui-overlay { position: absolute; pointer-events: none; width: 100%; height: 100%; top: 0; left: 0; }
+        .interactive { pointer-events: auto; }
+        
+        /* Loading spinner */
+        #loader {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-size: 1.5rem; font-weight: bold;
+        }
+
+        /* Power bar */
+        #power-meter {
+            position: absolute; right: 20px; top: 50%; transform: translateY(-50%);
+            width: 20px; height: 200px; background: rgba(0,0,0,0.5);
+            border-radius: 10px; border: 2px solid white; overflow: hidden;
+            display: none;
+        }
+        #power-fill {
+            width: 100%; height: 0%; background: linear-gradient(to top, #00ff00, #ffff00, #ff0000);
+            position: absolute; bottom: 0; transition: height 0.1s;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loader">Loading 3D Engine...</div>
+
+    <div id="canvas-container"></div>
+
+    <div class="ui-overlay flex flex-col justify-between p-6">
+        <div class="flex justify-between items-start">
+            <div class="bg-black/50 p-4 rounded-xl backdrop-blur-sm text-white border border-white/20">
+                <div class="text-sm uppercase tracking-widest text-gray-300">Score</div>
+                <div class="text-4xl font-bold text-yellow-400" id="score">0</div>
+            </div>
+            <button id="reset-btn" class="interactive bg-white/10 hover:bg-white/20 active:bg-white/30 text-white border border-white/30 px-6 py-3 rounded-full font-bold transition backdrop-blur-sm">
+                ↻ Reset
+            </button>
+        </div>
+        
+        <div id="instruction" class="text-center text-white/80 text-lg font-medium animate-pulse mb-10 pointer-events-none select-none drop-shadow-md">
+            Swipe Up to Toss!
+        </div>
+    </div>
+
+    <!-- Power Meter UI -->
+    <div id="power-meter"><div id="power-fill"></div></div>
+
+    <!-- Import Maps shim for modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
+
+        // --- Game State ---
+        let scene, camera, renderer;
+        let world;
+        let timeStep = 1 / 60;
+        let lastCallTime;
+        
+        // Objects
+        let ballMeshes = [], ballBodies = [];
+        let canMeshes = [], canBodies = [];
+        let tableBody;
+        let currentBallMesh, currentBallBody;
+        
+        // Gameplay
+        let score = 0;
+        let gameActive = true;
+        let canTexture;
+        let ballStartPos = new CANNON.Vec3(0, 1.5, 8);
+        
+        // Input
+        let isDragging = false;
+        let startX, startY;
+        let lastX, lastY;
+        let dragStartTime;
+
+        // UI
+        const scoreEl = document.getElementById('score');
+        const instructionEl = document.getElementById('instruction');
+        const resetBtn = document.getElementById('reset-btn');
+        const loader = document.getElementById('loader');
+        const powerMeter = document.getElementById('power-meter');
+        const powerFill = document.getElementById('power-fill');
+
+        // Sounds (Synthesized)
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        function playSound(type) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+
+            if (type === 'throw') {
+                osc.type = 'triangle';
+                osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.3);
+                gainNode.gain.setValueAtTime(0.5, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.3);
+            } else if (type === 'hit') {
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(150 + Math.random() * 50, audioCtx.currentTime);
+                gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            }
+        }
+
+        // --- Initialization ---
+
+        function init() {
+            // Remove loader
+            loader.style.display = 'none';
+
+            // 1. Setup Three.js
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x202025);
+            scene.fog = new THREE.Fog(0x202025, 10, 25);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 4, 12);
+            camera.lookAt(0, 2, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(5, 10, 5);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 1024;
+            dirLight.shadow.mapSize.height = 1024;
+            dirLight.shadow.camera.near = 0.5;
+            dirLight.shadow.camera.far = 50;
+            scene.add(dirLight);
+
+            // 2. Setup Cannon.js
+            world = new CANNON.World();
+            world.gravity.set(0, -9.82, 0);
+            
+            // Materials
+            const defaultMaterial = new CANNON.Material('default');
+            const defaultContactMaterial = new CANNON.ContactMaterial(defaultMaterial, defaultMaterial, {
+                friction: 0.3,
+                restitution: 0.5, // Bounciness
+            });
+            world.addContactMaterial(defaultContactMaterial);
+
+            // 3. Create Scene Objects
+            createEnvironment();
+            canTexture = createCanTexture(); // Procedural texture
+            resetGame();
+
+            // 4. Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            
+            // Input
+            const canvas = renderer.domElement;
+            canvas.addEventListener('mousedown', onPointerDown);
+            canvas.addEventListener('mousemove', onPointerMove);
+            window.addEventListener('mouseup', onPointerUp);
+            
+            canvas.addEventListener('touchstart', onPointerDown, { passive: false });
+            canvas.addEventListener('touchmove', onPointerMove, { passive: false });
+            window.addEventListener('touchend', onPointerUp);
+
+            resetBtn.addEventListener('click', resetGame);
+
+            // 5. Start Loop
+            requestAnimationFrame(animate);
+        }
+
+        function createEnvironment() {
+            // Floor (Three)
+            const floorGeo = new THREE.PlaneGeometry(50, 50);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+            const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            // Floor (Cannon)
+            const floorShape = new CANNON.Plane();
+            const floorBody = new CANNON.Body({ mass: 0 }); // Static
+            floorBody.addShape(floorShape);
+            floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+            world.addBody(floorBody);
+
+            // Table
+            const tableW = 4, tableH = 2, tableD = 4;
+            const tableGeo = new THREE.BoxGeometry(tableW, tableH, tableD);
+            const tableMat = new THREE.MeshStandardMaterial({ color: 0x5D4037, roughness: 0.6 });
+            const tableMesh = new THREE.Mesh(tableGeo, tableMat);
+            tableMesh.position.set(0, tableH/2, 0);
+            tableMesh.castShadow = true;
+            tableMesh.receiveShadow = true;
+            scene.add(tableMesh);
+
+            const tableShape = new CANNON.Box(new CANNON.Vec3(tableW/2, tableH/2, tableD/2));
+            tableBody = new CANNON.Body({ mass: 0 });
+            tableBody.addShape(tableShape);
+            tableBody.position.set(0, tableH/2, 0);
+            world.addBody(tableBody);
+        }
+
+        function createCanTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            
+            // Background white
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0,0,128,128);
+            
+            // Red stripes
+            ctx.fillStyle = '#ef4444'; // Tailwind Red 500
+            ctx.fillRect(0, 20, 128, 20);
+            ctx.fillRect(0, 60, 128, 20);
+            ctx.fillRect(0, 100, 128, 20);
+
+            // Rim
+            ctx.fillStyle = '#cbd5e1'; // Metallic grey
+            ctx.fillRect(0, 0, 128, 5);
+            ctx.fillRect(0, 123, 128, 5);
+
+            const tex = new THREE.CanvasTexture(canvas);
+            return tex;
+        }
+
+        function spawnCans() {
+            // Clear old cans
+            canMeshes.forEach(m => scene.remove(m));
+            canBodies.forEach(b => world.removeBody(b));
+            canMeshes = [];
+            canBodies = [];
+
+            const canRadius = 0.35;
+            const canHeight = 0.9;
+            const tableHeight = 2; // matches tableH from env
+            
+            // Pyramid Formation
+            // Row 3 (Bottom)
+            for(let i=-1; i<=1; i++) createSingleCan(i * (canRadius*2.1), tableHeight + canHeight/2, 0);
+            // Row 2
+            for(let i=-0.5; i<=0.5; i+=1.0) createSingleCan(i * (canRadius*2.1), tableHeight + canHeight*1.5, 0);
+            // Row 1 (Top)
+            createSingleCan(0, tableHeight + canHeight*2.5, 0);
+        }
+
+        function createSingleCan(x, y, z) {
+            const r = 0.35;
+            const h = 0.9;
+            
+            // Three Mesh
+            const geo = new THREE.CylinderGeometry(r, r, h, 24);
+            // Rotate texture for cylinder
+            const mat = new THREE.MeshStandardMaterial({ map: canTexture });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.userData = { isCan: true, scored: false };
+            scene.add(mesh);
+            canMeshes.push(mesh);
+
+            // Cannon Body
+            const shape = new CANNON.Cylinder(r, r, h, 12);
+            // Cannon cylinders are oriented along Z, Three along Y. Rotation needed.
+            // But actually CANNON.Cylinder recent versions align better, let's use quaternion to align if needed.
+            // In modern Cannon-es, cylinder is Y-aligned? Let's verify visually. 
+            // Actually Cannon cylinder is Z aligned. We need to rotate the shape relative to the body or rotate the body.
+            // The easier way in cannon is to use a specific rotation on the shape addition.
+            
+            const body = new CANNON.Body({ mass: 0.3 });
+            const q = new CANNON.Quaternion();
+            q.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2); 
+            body.addShape(shape, new CANNON.Vec3(0,0,0), q);
+            
+            body.position.set(x, y, z);
+            world.addBody(body);
+            canBodies.push(body);
+            
+            // Link mesh to body for updating
+            mesh.userData.body = body;
+
+            // Collision listener for sound
+            body.addEventListener("collide", (e) => {
+                const relVel = e.contact.getImpactVelocityAlongNormal();
+                if(Math.abs(relVel) > 1) {
+                    playSound('hit');
+                }
+            });
+        }
+
+        function spawnBall() {
+            if (currentBallMesh) {
+                // If existing ball, fade it out or keep it?
+                // Let's keep previous balls for physics chaos
+                ballMeshes.push(currentBallMesh);
+                ballBodies.push(currentBallBody);
+            }
+
+            const r = 0.25;
+            
+            // Three
+            const geo = new THREE.SphereGeometry(r, 32, 32);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xfacc15, roughness: 0.4, metalness: 0.1 });
+            currentBallMesh = new THREE.Mesh(geo, mat);
+            currentBallMesh.castShadow = true;
+            scene.add(currentBallMesh);
+
+            // Cannon
+            const shape = new CANNON.Sphere(r);
+            currentBallBody = new CANNON.Body({ mass: 2 }); // Heavier ball
+            currentBallBody.addShape(shape);
+            currentBallBody.position.copy(ballStartPos);
+            currentBallBody.linearDamping = 0.3; // Slow down air resistance
+            
+            // Make it kinematic/static initially so it stays in hand
+            currentBallBody.type = CANNON.Body.STATIC;
+            world.addBody(currentBallBody);
+        }
+
+        function resetGame() {
+            // Reset Score
+            score = 0;
+            scoreEl.textContent = score;
+            instructionEl.style.opacity = 1;
+
+            // Clear extra balls
+            ballMeshes.forEach(m => scene.remove(m));
+            ballBodies.forEach(b => world.removeBody(b));
+            ballMeshes = [];
+            ballBodies = [];
+            
+            if(currentBallMesh) {
+                scene.remove(currentBallMesh);
+                world.removeBody(currentBallBody);
+                currentBallMesh = null;
+                currentBallBody = null;
+            }
+
+            spawnCans();
+            spawnBall();
+            gameActive = true;
+        }
+
+        // --- Interaction Logic ---
+
+        function onPointerDown(e) {
+            if(!gameActive) return;
+            e.preventDefault(); // prevent scrolling
+            isDragging = true;
+            
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+            startX = clientX;
+            startY = clientY;
+            lastX = clientX;
+            lastY = clientY;
+            dragStartTime = performance.now();
+
+            instructionEl.style.opacity = 0;
+            
+            // Visual feedback
+            powerMeter.style.display = 'block';
+            powerFill.style.height = '0%';
+        }
+
+        function onPointerMove(e) {
+            if(!isDragging) return;
+            e.preventDefault();
+
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+            lastX = clientX;
+            lastY = clientY;
+
+            // Move ball slightly visually to follow finger horizontally
+            // Map screen X to World X roughly
+            const xPercent = (clientX / window.innerWidth) * 2 - 1;
+            // Limit movement
+            if(currentBallMesh && currentBallBody) {
+                currentBallBody.position.x = xPercent * 2;
+                currentBallMesh.position.x = currentBallBody.position.x;
+            }
+
+            // Update Power Meter based on vertical drag
+            const distY = startY - clientY;
+            const powerPct = Math.min(Math.max(distY / 300, 0), 1) * 100;
+            powerFill.style.height = `${powerPct}%`;
+        }
+
+        function onPointerUp(e) {
+            if(!isDragging) return;
+            isDragging = false;
+            powerMeter.style.display = 'none';
+
+            const endTime = performance.now();
+            const dt = (endTime - dragStartTime) / 1000;
+
+            const deltaX = lastX - startX;
+            const deltaY = startY - lastY; // Positive is UP swipe
+
+            // Threshold for a throw
+            if (deltaY > 30) {
+                throwBall(deltaX, deltaY, dt);
+            } else {
+                // Reset ball position if not thrown
+                 if(currentBallBody) currentBallBody.position.copy(ballStartPos);
+            }
+        }
+
+        function throwBall(dx, dy, dt) {
+            if(!currentBallBody) return;
+
+            // Make body dynamic
+            currentBallBody.type = CANNON.Body.DYNAMIC;
+            currentBallBody.updateMassProperties(); // Important when changing type
+
+            // Calculate Force
+            // Z is forward (negative in Three/Cannon usually depends on setup, here camera is at z=12 looking at 0, so -Z is forward)
+            
+            // Normalize speed
+            const speedY = Math.min(dy / window.innerHeight, 1.0); // 0 to 1
+            const speedX = dx / window.innerWidth;
+            
+            // Base throw power
+            const power = 15 + (speedY * 25); 
+
+            // Vectors
+            const impulse = new CANNON.Vec3(
+                speedX * 10,   // Sideways
+                5 + (speedY * 5), // Upwards arc
+                -power         // Forward
+            );
+
+            // Apply to center of mass
+            currentBallBody.velocity.set(impulse.x, impulse.y, impulse.z);
+            
+            // Spin
+            currentBallBody.angularVelocity.set(Math.random()*10, 0, 0);
+
+            playSound('throw');
+
+            // Spawn next ball after delay
+            setTimeout(() => {
+                spawnBall();
+            }, 1000);
+        }
+
+        // --- Animation Loop ---
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            const dt = timeStep; // Fixed step for physics stability
+
+            // Step Physics
+            world.step(dt);
+
+            // Sync Objects
+            // 1. Cans
+            canMeshes.forEach(mesh => {
+                const body = mesh.userData.body;
+                mesh.position.copy(body.position);
+                mesh.quaternion.copy(body.quaternion);
+
+                // Check scoring
+                if (!mesh.userData.scored) {
+                    // Conditions: Touched ground (y < 0.5) OR Fell far off table
+                    // Table top is at y=2. If y < 1.5, it's off the stack.
+                    // Let's use distance from center or height.
+                    
+                    // Simple check: If Y < 1.0 (Table height is 2, floor is 0), it fell off.
+                    if (mesh.position.y < 1.5) {
+                        mesh.userData.scored = true;
+                        score += 10;
+                        scoreEl.textContent = score;
+                        scoreEl.classList.remove('scale-125');
+                        void scoreEl.offsetWidth; // trigger reflow
+                        scoreEl.classList.add('scale-125', 'transition-transform');
+                    }
+                }
+            });
+
+            // 2. Balls
+            if (currentBallMesh && currentBallBody) {
+                currentBallMesh.position.copy(currentBallBody.position);
+                currentBallMesh.quaternion.copy(currentBallBody.quaternion);
+            }
+            // Update previous balls
+            for(let i=0; i<ballMeshes.length; i++) {
+                ballMeshes[i].position.copy(ballBodies[i].position);
+                ballMeshes[i].quaternion.copy(ballBodies[i].quaternion);
+                
+                // Cleanup balls that fell off world
+                if(ballMeshes[i].position.y < -10) {
+                    // Could remove here, but for simplicity just leave them falling infinitely or stop updating
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Initialize
+        init();
+
+    </script>
+</body>
+</html>
